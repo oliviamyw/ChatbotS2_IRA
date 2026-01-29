@@ -1,0 +1,708 @@
+# =========================
+# Style Loom Chatbot Experiment (STUDY 2 - VISUAL PRESENT × IRRELEVANT)
+# Visual cue fixed (name + image present) + KB-grounded answers (LangChain) + GPT fallback
+# Study 2 factor: response relevance (THIS FILE = IRRELEVANT). Brand factor removed.
+#
+# Folder requirement:
+#   ./data/  (md/json knowledge files)
+#
+# Streamlit Secrets required:
+#   OPENAI_API_KEY
+#   SUPABASE_URL
+#   SUPABASE_ANON_KEY
+#
+# Supabase tables (must exist):
+#   public.sessions(
+#       session_id text primary key,
+#       ts_start timestamptz,
+#       ts_end timestamptz,
+#       identity_option text,
+#       relevance_condition text,
+#       name_present text,
+#       picture_present text,
+#       scenario text,
+#       user_turns int,
+#       bot_turns int
+#   )
+# =========================
+
+import os
+import re
+import uuid
+import json
+import datetime
+from pathlib import Path
+from typing import Optional, Dict, List, Tuple
+
+import streamlit as st
+from openai import OpenAI
+from supabase import create_client  # Supabase is REQUIRED
+
+# LangChain / Vector
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import DirectoryLoader, TextLoader
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import Chroma
+
+
+# -------------------------
+# Page config
+# -------------------------
+st.set_page_config(page_title="Style Loom Chatbot Experiment", layout="centered")
+
+
+# -------------------------
+# Paths
+# -------------------------
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+
+
+# -------------------------
+# Experiment constants
+# -------------------------
+MODEL_CHAT = "gpt-4o-mini"
+MODEL_EMBED = "text-embedding-3-small"
+MIN_USER_TURNS = 5
+
+TBL_SESSIONS = "sessions"
+
+
+# -------------------------
+# OpenAI client
+# -------------------------
+API_KEY = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
+if not API_KEY:
+    st.error("OPENAI_API_KEY is not set. Please configure it in environment variables or st.secrets.")
+    st.stop()
+client = OpenAI(api_key=API_KEY)
+
+
+# -------------------------
+# Supabase client (REQUIRED)
+# -------------------------
+SUPA_URL = st.secrets.get("SUPABASE_URL", None)
+SUPA_KEY = st.secrets.get("SUPABASE_ANON_KEY", None)
+if not SUPA_URL or not SUPA_KEY:
+    st.error("Supabase credentials are missing. Please set SUPABASE_URL and SUPABASE_ANON_KEY in st.secrets.")
+    st.stop()
+
+@st.cache_resource(show_spinner=False)
+def get_supabase():
+    return create_client(SUPA_URL, SUPA_KEY)
+
+supabase = get_supabase()
+
+
+# -------------------------
+# -------------------------
+# Study 2 cell condition (THIS FILE)
+# -------------------------
+identity_option = "With name and image"
+show_name = True
+show_picture = True
+CHATBOT_NAME = "Skyler"
+CHATBOT_PICTURE = "https://i.imgur.com/4uLz4FZ.png"
+
+# Study 2 factor: response relevance (THIS FILE = IRRELEVANT)
+relevance_condition = "Irrelevant"
+
+# Fixed irrelevant response (used for every user input)
+IRRELEVANT_REPLY = "You can explore our latest collection through our homepage."
+
+
+def chatbot_speaker() -> str:
+    return CHATBOT_NAME if show_name else "Assistant"
+
+
+# -------------------------
+# Header UI (photo only here; chat transcript is text-only)
+# -------------------------
+st.markdown(
+    "<div style='display:flex;align-items:center;gap:8px;margin:8px 0 4px 0;'>"
+    "<div style='font-weight:700;font-size:20px;letter-spacing:0.3px;'>Style Loom</div>"
+    "</div>",
+    unsafe_allow_html=True,
+)
+if show_picture:
+    try:
+        st.image(CHATBOT_PICTURE, width=84)
+    except Exception:
+        pass
+
+
+# -------------------------
+# Scenarios (dropdown)
+# -------------------------
+SCENARIOS = [
+    "— Select a scenario —",
+    "Check product availability",
+    "Shipping & returns",
+    "Size & fit guidance",
+    "New arrivals & collections",
+    "Rewards & membership",
+    "Discounts & promotions",
+    "About the brand",
+    "Other",
+]
+
+SCENARIO_TO_INTENT = {
+    "Check product availability": "availability",
+    "Shipping & returns": "shipping_returns",
+    "Size & fit guidance": "size_fit",
+    "New arrivals & collections": "new_arrivals",
+    "Rewards & membership": "rewards",
+    "Discounts & promotions": "promotions",
+    "About the brand": "about",
+    "Other": "other",
+    "— Select a scenario —": "none",
+}
+
+INTENT_TO_FILES = {
+    "availability": [
+        "availability_playbook.md",
+        "availability_rules.md",
+        "inventory_schema.json",
+        "mens_and_womens_catalog.md",
+    ],
+    "shipping_returns": [
+        "shipping_returns.md",
+        "free_returns_policy.md",
+    ],
+    "size_fit": [
+        "size_chart.md",
+        "vocab.md",
+    ],
+    "new_arrivals": [
+        "new_drop.md",
+        "current.md",
+    ],
+    "rewards": [
+        "rewards.md",
+    ],
+    "promotions": [
+        "current.md",
+        "promotions_rules.md",
+        "price_policy_and_ranges.md",
+    ],
+    "about": [
+        "about.md",
+    ],
+}
+
+FILE_TO_INTENT: Dict[str, str] = {}
+for ik, files in INTENT_TO_FILES.items():
+    for fn in files:
+        FILE_TO_INTENT[fn] = ik
+
+
+def scenario_to_intent(scenario: Optional[str]) -> str:
+    if not scenario:
+        return "none"
+    return SCENARIO_TO_INTENT.get(scenario, "other")
+
+
+# -------------------------
+# Intent detection (ENGLISH ONLY) for auto-switch (Option C)
+# -------------------------
+INTENT_KEYWORDS: Dict[str, List[str]] = {
+    "new_arrivals": ["new drop", "new arrivals", "new arrival", "new collection", "latest", "this season"],
+    "size_fit": ["size", "sizing", "fit", "measurement", "measurements", "bust", "waist", "hip", "xs", "xl", "cm", "inch"],
+    "shipping_returns": ["shipping", "delivery", "return", "returns", "exchange", "refund", "ship"],
+    "promotions": ["discount", "promo", "promotion", "coupon", "code", "sale", "deal"],
+    "rewards": ["reward", "rewards", "points", "membership", "tier", "vip"],
+    "availability": ["available", "availability", "in stock", "out of stock", "restock", "sold out", "inventory"],
+    "about": ["about", "brand", "story", "who are you", "who is", "ceo"],
+}
+
+INTENT_TO_SCENARIO = {
+    "availability": "Check product availability",
+    "shipping_returns": "Shipping & returns",
+    "size_fit": "Size & fit guidance",
+    "new_arrivals": "New arrivals & collections",
+    "rewards": "Rewards & membership",
+    "promotions": "Discounts & promotions",
+    "about": "About the brand",
+}
+
+
+def detect_intent(user_text: str) -> Optional[str]:
+    t = (user_text or "").strip().lower()
+    if not t:
+        return None
+    t = re.sub(r"\s+", " ", t)
+    best_intent = None
+    best_score = 0
+    for intent_key, kws in INTENT_KEYWORDS.items():
+        score = sum(1 for kw in kws if kw in t)
+        if score > best_score:
+            best_score = score
+            best_intent = intent_key
+    return best_intent if best_score >= 1 else None
+
+
+# -------------------------
+# Availability: product-type locking to prevent category jumps (pants -> jacket)
+# -------------------------
+PRODUCT_TYPE_KEYWORDS = {
+    "pants": ["pants", "training pants", "joggers", "leggings", "trousers", "sweatpants"],
+    "shirts": ["shirt", "t-shirt", "tee", "top", "tank", "sports bra"],
+    "jackets": ["jacket", "outerwear", "coat", "windbreaker"],
+    "knitwear": ["knit", "sweater", "hoodie", "cardigan"],
+}
+
+def detect_product_type(text: str) -> Optional[str]:
+    t = (text or "").lower()
+    for ptype, kws in PRODUCT_TYPE_KEYWORDS.items():
+        if any(kw in t for kw in kws):
+            return ptype
+    return None
+
+
+# -------------------------
+# Knowledge base loader (LangChain)
+# -------------------------
+@st.cache_resource(show_spinner=False)
+def build_vectorstore(data_dir: Path) -> Optional[Chroma]:
+    if not data_dir.exists():
+        return None
+
+    docs = []
+
+    md_loader = DirectoryLoader(
+        str(data_dir),
+        glob="**/*.md",
+        loader_cls=TextLoader,
+        loader_kwargs={"autodetect_encoding": True},
+        show_progress=False,
+    )
+    docs.extend(md_loader.load())
+
+    json_loader = DirectoryLoader(
+        str(data_dir),
+        glob="**/*.json",
+        loader_cls=TextLoader,
+        loader_kwargs={"autodetect_encoding": True},
+        show_progress=False,
+    )
+    docs.extend(json_loader.load())
+
+    for d in docs:
+        src = d.metadata.get("source", "")
+        name = os.path.basename(src)
+        d.metadata["intent"] = FILE_TO_INTENT.get(name, "general")
+        d.metadata["filename"] = name
+
+    splitter = RecursiveCharacterTextSplitter(chunk_size=900, chunk_overlap=120)
+    chunks = splitter.split_documents(docs)
+
+    embeddings = OpenAIEmbeddings(model=MODEL_EMBED, openai_api_key=API_KEY)
+    return Chroma.from_documents(
+        documents=chunks,
+        embedding=embeddings,
+        collection_name="styleloom_kb",
+    )
+
+vectorstore = None  # Irrelevant condition: KB is not used
+
+
+def retrieve_context(
+    query: str,
+    intent_key: Optional[str],
+    k: int = 8,
+    min_score: float = 0.25,
+) -> str:
+    if not vectorstore:
+        return ""
+
+    filt = None
+    if intent_key and intent_key not in ("none", "other"):
+        filt = {"intent": intent_key}
+
+    try:
+        hits = vectorstore.similarity_search_with_relevance_scores(query, k=k, filter=filt)
+        filtered = [(d, s) for (d, s) in hits if s is not None and s >= min_score]
+        if not filtered:
+            return ""
+        blocks = []
+        for i, (d, s) in enumerate(filtered, 1):
+            fn = d.metadata.get("filename", "unknown")
+            blocks.append(f"[Doc{i} score={s:.2f} file={fn}]\n{d.page_content.strip()}")
+        return "\n\n".join(blocks)
+    except Exception:
+        try:
+            hits = vectorstore.similarity_search(query, k=k, filter=filt)
+        except Exception:
+            hits = vectorstore.similarity_search(query, k=k)
+
+        if not hits:
+            return ""
+        blocks = []
+        for i, d in enumerate(hits, 1):
+            fn = d.metadata.get("filename", "unknown")
+            blocks.append(f"[Doc{i} file={fn}]\n{d.page_content.strip()}")
+        return "\n\n".join(blocks)
+
+
+# -------------------------
+# Deterministic scenario fallback + follow-up continuity
+# -------------------------
+FOLLOWUP_ACK_PAT = re.compile(
+    r"^(sure|yes|yeah|yep|ok|okay|go ahead|please do|do it|sounds good|tell me|show me)\b",
+    re.IGNORECASE,
+)
+
+def is_generic_followup(text: str) -> bool:
+    t = (text or "").strip()
+    return (len(t) <= 18) and bool(FOLLOWUP_ACK_PAT.search(t))
+
+def load_intent_files_as_context(intent_key: str) -> str:
+    files = INTENT_TO_FILES.get(intent_key, [])
+    if not files:
+        return ""
+    blocks = []
+    for fn in files:
+        fp = DATA_DIR / fn
+        if fp.exists():
+            try:
+                content = fp.read_text(encoding="utf-8", errors="ignore").strip()
+            except Exception:
+                content = ""
+            if content:
+                blocks.append(f"[FILE: {fn}]\n{content}")
+    return "\n\n".join(blocks)
+
+
+# -------------------------
+# LLM helpers
+# -------------------------
+def llm_chat(messages: List[Dict[str, str]], temperature: float = 0.3) -> str:
+    resp = client.chat.completions.create(
+        model=MODEL_CHAT,
+        messages=messages,
+        temperature=temperature,
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+
+def mirror_user_intent(user_text: str) -> str:
+    """
+    Lightweight, domain-agnostic mirroring.
+
+    Goal: acknowledge the user's request without introducing new concepts.
+    """
+    t = (user_text or "").strip()
+
+    # Remove common greetings
+    t = re.sub(r"^(hi|hello|hey)\b[\s,]*", "", t, flags=re.IGNORECASE).strip()
+
+    # Clean punctuation/spacing
+    t = t.rstrip("?.! ").strip()
+    t = re.sub(r"\s+", " ", t)
+
+    if not t:
+        return "Understood."
+
+    words = t.split()
+    short = t if len(words) <= 12 else " ".join(words[:12]) + "..."
+
+    low = short.lower()
+
+    # Yes/no style questions -> "whether ..."
+    if low.startswith(("do you", "can you", "could you", "would you", "is there", "are there")):
+        parts = short.split(maxsplit=2)
+        rest = parts[2] if len(parts) >= 3 else ""
+        rest = rest[0].lower() + rest[1:] if rest else "that."
+        return f"You’re asking whether {rest}"
+
+    if "looking for" in low or low.startswith(("i need", "i want")):
+        return f"You’re looking for {short.lower()}."
+    return f"You’re asking about {short.lower()}."
+
+
+def answer_grounded(user_text: str, context: str, intent_key: Optional[str] = None) -> str:
+    """
+    Relevant answer: deterministic mirroring + grounded response.
+    """
+    mirror = mirror_user_intent(user_text)
+
+    system = f"""You are Style Loom's virtual assistant for a fashion retail study.
+You MUST use the BUSINESS CONTEXT below as your source of truth. Do not invent details not supported by the context.
+
+Response rules (Study 2: RELEVANT responses):
+- Do NOT use apologies or inability statements (e.g., "Unfortunately, I can't...").
+- Answer ONLY what the user asked. Do not add extra tips, upsell content, or unrelated details.
+- Keep the response concise (2–4 sentences). Use a neutral, professional tone. No emojis.
+- Ask at most ONE follow-up question, only if truly needed to proceed.
+
+Formatting by intent:
+- Product-related intents (size_fit, new_arrivals):
+  * If the user is asking for a recommendation: provide ONE option with 1–2 reasons grounded in the context, then ask ONE clarifying question.
+  * If the user is asking for factual info (e.g., size chart): answer directly; ask ONE question only if needed.
+- Policy/operations intents (shipping_returns, promotions, rewards): provide a concise, concrete summary first, including key constraints (time window, conditions, eligibility, processing time) if present in the context.
+- Other/about intents (about, other): answer directly and briefly; ask ONE question only if needed.
+
+Intent: {intent_key or "unknown"}.
+"""
+
+    msgs = [
+        {"role": "system", "content": system},
+        {"role": "system", "content": f"BUSINESS CONTEXT:\n{context}"},
+        {"role": "user", "content": user_text},
+    ]
+    core = llm_chat(msgs, temperature=0.2)
+    return f"{mirror} {core}".strip()
+
+
+def answer_fallback(user_text: str) -> str:
+    # Minimal, relevant fallback when KB retrieval fails.
+    return "Could you share one more detail so I can help (for example, the item name or what specifically you want to know)?"
+
+def generate_answer(user_text: str, scenario: Optional[str]) -> Tuple[str, str, bool]:
+    intent_key = scenario_to_intent(scenario)
+
+    # Follow-up continuity
+    if is_generic_followup(user_text) and st.session_state.get("last_kb_context", "").strip():
+        ctx = st.session_state["last_kb_context"]
+        used_intent = st.session_state.get("last_intent_used") or intent_key
+        ans = answer_grounded(user_text, ctx, intent_key=used_intent)
+        return ans, used_intent, True
+
+    
+    # Availability: use a fixed, controlled script (Study 2 relevance operationalization)
+    if intent_key == "availability":
+        mirror = mirror_user_intent(user_text)
+        reply = (
+            f"{mirror} "
+            "We currently have more than five options available in this style. "
+            "Would you like to take a look at similar options?"
+        )
+        st.session_state["last_kb_context"] = ""
+        st.session_state["last_intent_used"] = intent_key
+        return reply, intent_key, False
+
+# Availability bias by locked product type
+    query_for_search = user_text
+    if intent_key == "availability":
+        ptype = st.session_state.get("active_product_type")
+        if ptype:
+            query_for_search = f"{ptype} {user_text}"
+
+    context = ""
+    used_kb = False
+
+    # 1) Vector retrieval
+    if vectorstore:
+        context = retrieve_context(query_for_search, intent_key=intent_key, k=8, min_score=0.25)
+        if context.strip():
+            used_kb = True
+
+    # 2) Deterministic fallback (load all files for that intent)
+    if not context.strip() and intent_key not in ("none", "other"):
+        context = load_intent_files_as_context(intent_key)
+        if context.strip():
+            used_kb = True
+
+    # 3) GPT fallback
+    if not context.strip():
+        st.session_state["last_kb_context"] = ""
+        st.session_state["last_intent_used"] = intent_key
+        return answer_fallback(user_text), intent_key, False
+
+    ans = answer_grounded(user_text, context, intent_key=intent_key)
+
+    # Persist
+    st.session_state["last_kb_context"] = context
+    st.session_state["last_intent_used"] = intent_key
+
+    return ans, intent_key, used_kb
+
+
+# -------------------------
+# Session state initialization
+# -------------------------
+defaults = {
+    "chat_history": [],
+    "session_id": uuid.uuid4().hex[:10],
+    "greeted_once": False,
+    "ended": False,
+    "rating_saved": False,
+    "user_turns": 0,
+    "bot_turns": 0,
+    "last_user_selected_scenario": "— Select a scenario —",
+    "active_scenario": None,
+    "switch_log": [],
+    "session_started_logged": False,
+    "last_kb_context": "",
+    "last_intent_used": None,
+    "active_product_type": None,
+}
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+
+
+# -------------------------
+# Greeting (first assistant message) - EXACT TEXT YOU PROVIDED
+# -------------------------
+if not st.session_state.greeted_once:
+
+    greet_text = (
+        "Hi, I’m Skyler, Style Loom’s virtual assistant. "
+        "I’m here to help with your shopping questions."
+    )
+    st.session_state.chat_history.append((chatbot_speaker(), greet_text))
+    st.session_state.greeted_once = True
+
+
+# -------------------------
+# UI: scenario dropdown
+# -------------------------
+st.markdown("**How can I help you today?**")
+
+selected = st.selectbox(
+    "Choose a topic:",
+    options=SCENARIOS,
+    index=SCENARIOS.index(st.session_state.last_user_selected_scenario)
+    if st.session_state.last_user_selected_scenario in SCENARIOS else 0,
+)
+
+prev_selected = st.session_state.last_user_selected_scenario
+st.session_state.last_user_selected_scenario = selected
+
+# Confirmation message when user changes category
+if selected != "— Select a scenario —" and selected != prev_selected:
+    st.session_state.active_scenario = selected
+
+    if selected != "Check product availability":
+        st.session_state.active_product_type = None
+
+    confirm_text = f"Sure, I will help you with **{selected}**. Please ask me a question."
+    st.session_state.chat_history.append((chatbot_speaker(), confirm_text))
+
+st.divider()
+
+
+# -------------------------
+# Render chat history (TEXT ONLY; no chat bubbles/icons)
+# -------------------------
+for spk, msg in st.session_state.chat_history:
+    if spk == chatbot_speaker():
+        st.markdown(f"**{CHATBOT_NAME}:** {msg}")
+    else:
+        st.markdown("**User:** " + msg)
+
+
+# -------------------------
+# Chat input
+# -------------------------
+user_text = None
+if not st.session_state.ended:
+    user_text = st.chat_input("Type your message here...")
+
+
+# -------------------------
+# End button and rating UI
+# -------------------------
+end_col1, end_col2 = st.columns([1, 2])
+
+with end_col1:
+    can_end = (st.session_state.user_turns >= MIN_USER_TURNS) and (not st.session_state.ended)
+    if st.button("End chat", disabled=not can_end):
+        st.session_state.ended = True
+
+with end_col2:
+    if not st.session_state.ended:
+        completed = st.session_state.user_turns
+        remaining = max(0, MIN_USER_TURNS - completed)
+
+        if remaining > 0:
+            st.caption(
+                f"Please complete at least {MIN_USER_TURNS} user turns before ending the chat. "
+                f"Progress: {completed}/{MIN_USER_TURNS} (need {remaining} more)."
+            )
+        else:
+            st.caption(f"Progress: {completed}/{MIN_USER_TURNS}. You can end the chat now.")
+
+# -------------------------
+# Save ONLY at the end
+# -------------------------
+# -------------------------
+# Save ONLY at the end (transcripts + satisfaction + sessions end)
+# -------------------------
+if st.session_state.ended and not st.session_state.rating_saved:
+    rating = st.slider("Overall satisfaction with the chatbot (1 = very low, 7 = very high)", 1, 7, 4)
+    prolific_id = st.text_input("Prolific ID", value="")
+
+    if st.button("Submit rating and save"):
+        ts_now = datetime.datetime.utcnow().isoformat() + "Z"
+
+        final_scenario = st.session_state.active_scenario or (
+            selected if selected != "— Select a scenario —" else "Other"
+        )
+
+        # ===== Transcript text (human-readable; same style as your older version) =====
+        transcript_lines = []
+        transcript_lines.append("===== Session Transcript =====")
+        transcript_lines.append(f"timestamp       : {ts_now}")
+        transcript_lines.append(f"session_id      : {st.session_state.session_id}")
+        transcript_lines.append(f"identity_option : {identity_option}")
+        transcript_lines.append(f"relevance       : {relevance_condition}")
+        transcript_lines.append(f"picture_present : {'present' if show_picture else 'absent'}")
+        transcript_lines.append(f"scenario        : {final_scenario}")
+        transcript_lines.append(f"name_present    : {'present' if show_name else 'absent'}")
+        transcript_lines.append(f"user_turns      : {st.session_state.user_turns}")
+        transcript_lines.append(f"bot_turns       : {st.session_state.bot_turns}")
+        transcript_lines.append(f"prolific_id     : {(prolific_id.strip() or 'N/A')}")
+        transcript_lines.append("")
+        transcript_lines.append("---- Switch log ----")
+        transcript_lines.append(json.dumps(st.session_state.switch_log, ensure_ascii=False))
+        transcript_lines.append("")
+        transcript_lines.append("---- Chat transcript ----")
+        for spk, msg in st.session_state.chat_history:
+            transcript_lines.append(f"{spk}: {msg}")
+        transcript_lines.append("")
+        transcript_lines.append(f"Satisfaction (1-7): {int(rating)}")
+
+        transcript_text = "\n".join(transcript_lines)
+
+        # =========================
+        # SAVE (ONLY HERE)
+        # =========================
+        # Create/overwrite a single completed-session row.
+        # NOTE: We intentionally do NOT write anything to Supabase before this point.
+        session_payload = {
+            "session_id": st.session_state.session_id,
+            "ts_start": ts_now,  # start timestamp recorded at submit time (clean, no auto rows)
+            "ts_end": ts_now,
+            "identity_option": identity_option,
+            "relevance_condition": relevance_condition,
+            "name_present": "present" if show_name else "absent",
+            "picture_present": "present" if show_picture else "absent",
+            "scenario": final_scenario,
+            "user_turns": st.session_state.user_turns,
+            "bot_turns": st.session_state.bot_turns,
+            "prolific_id": prolific_id.strip() or None,
+            "transcript": transcript_text,
+            "satisfaction": int(rating),
+        }
+        supabase.table(TBL_SESSIONS).upsert(session_payload).execute()
+        # (TURN-LEVEL LOGGING DISABLED) We store only the final session-level transcript in public.sessions.
+
+        st.session_state.rating_saved = True
+        st.success("Saved. Thank you.")
+
+# -------------------------
+# Main interaction
+# -------------------------
+if user_text and not st.session_state.ended:
+    # Log user turn (in-memory only)
+    st.session_state.chat_history.append(("User", user_text))
+    st.session_state.user_turns += 1
+
+    # Irrelevant condition: always return the same fixed response (no mirroring, no KB, no intent switching)
+    st.session_state.chat_history.append((chatbot_speaker(), IRRELEVANT_REPLY))
+    st.session_state.bot_turns += 1
+
+    st.rerun()
