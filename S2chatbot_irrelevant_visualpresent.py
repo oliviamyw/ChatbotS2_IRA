@@ -30,6 +30,7 @@ import os
 import re
 import uuid
 import json
+import hashlib
 import datetime
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
@@ -107,10 +108,22 @@ CHATBOT_PICTURE = "https://i.imgur.com/4uLz4FZ.png"
 # Study 2 factor: response relevance (THIS FILE = IRRELEVANT)
 relevance_condition = "Irrelevant"
 
-# Fixed irrelevant response (used for every user input)
-IRRELEVANT_REPLY = "You can explore our latest collection through our homepage."
+# Irrelevant condition: campaign-focused, non-contingent replies (no input reflection)
+CAMPAIGN_POOL = [
+    "Our latest campaign is now live on the Style Loom homepage.",
+    "Style Loom’s newest campaign is featured on the homepage right now.",
+    "The homepage currently highlights our latest Style Loom campaign.",
+    "A new Style Loom campaign is live now and featured on the homepage.",
+    "Style Loom is running a new campaign, highlighted on the homepage.",
+    "The latest Style Loom campaign is currently showcased on the homepage.",
+]
 
-
+def pick_campaign_reply(session_id: str, turn_idx: int) -> str:
+    """Deterministic rotation (reproducible) based on session_id and turn index."""
+    key = f"{session_id}-{turn_idx}".encode("utf-8")
+    h = hashlib.sha256(key).hexdigest()
+    idx = int(h[:8], 16) % len(CAMPAIGN_POOL)
+    return CAMPAIGN_POOL[idx]
 def chatbot_speaker() -> str:
     return CHATBOT_NAME if show_name else "Assistant"
 
@@ -701,8 +714,11 @@ if user_text and not st.session_state.ended:
     st.session_state.chat_history.append(("User", user_text))
     st.session_state.user_turns += 1
 
-    # Irrelevant condition: always return the same fixed response (no mirroring, no KB, no intent switching)
-    st.session_state.chat_history.append((chatbot_speaker(), IRRELEVANT_REPLY))
+    # Irrelevant condition: campaign reply rotated deterministically (no mirroring, no KB, no intent switching)
+    turn_idx = st.session_state.bot_turns + 1
+    reply = pick_campaign_reply(st.session_state.session_id, turn_idx)
+    st.session_state.chat_history.append((chatbot_speaker(), reply))
     st.session_state.bot_turns += 1
 
     st.rerun()
+
